@@ -1,0 +1,449 @@
+/*
+UAAP COMBINED RESIDENCY + AFRICAN FSA RULE — V13
+Basketball GM Worker Console
+
+RUN
+1. Back up/export your league first.
+2. Open Tools > Danger Zone > Worker Console.
+3. Paste this entire script and click Run code.
+4. Run after free-agency signings are complete (phase 8), before the
+   next preseason/regular season begins.
+5. Safe to rerun in the same offseason.
+
+RULE 1 — TRANSFER RESIDENCY
+Uses the V7 residency detection logic:
+- A player with stats for one UAAP college team who signs with a different
+  UAAP college team through a phase-8 freeAgent transaction is restricted
+  for the following season.
+- First-time entrants without prior UAAP-team stats are exempt.
+- Applies the custom "Residency" injury for 40 games.
+- Saves and restores the player's original injury after the restricted season.
+
+RULE 3 — PLAYER APPEARANCE
+- Players with a cartoon-face `face` object are switched to Image URL
+  using `/img/blank-face.png`.
+- Newly generated African FSAs also use `/img/blank-face.png`.
+
+RULE 2 — AFRICAN FOREIGN STUDENT-ATHLETE
+- Checks only active teams among UAAP team IDs 0–15.
+- An African player already on the roster counts, even if injured.
+- If a team has no African player, creates and signs exactly one.
+- Generated player: 55–65 OVR, African country, 6'6\"–7'0\", PF/FC/C.
+- Maximum one African player per active team.
+- Safe to rerun: existing African players and the team/season marker prevent
+  duplicate generation.
+
+IMPORTANT
+This uses the BBGM injury system as an eligibility workaround. It does not
+create a native eligibility rule. The African player is created using the
+documented bbgm.player.generate/name/develop APIs.
+*/
+
+(async () => {
+    "use strict";
+
+    const COLLEGE_TIDS = new Set([
+        0, 1, 2, 3, 4, 5, 6, 7,
+        8, 9, 10, 11, 12, 13, 14, 15
+    ]);
+
+    // V7 residency settings — intentionally retained.
+    const MARKER = "uaapResidencyV7";
+    const INELIGIBILITY_INJURY = "Residency";
+    const INELIGIBILITY_GAMES = 40;
+
+    // Separate marker for the African FSA top-up.
+    const FSA_MARKER = "uaapAfricanFsaGeneratedForSeason";
+
+    const AFRICAN_COUNTRIES = [
+        "Angola", "Benin", "Botswana", "Burkina Faso", "Burundi",
+        "Cameroon", "Cape Verde", "Central African Republic", "Chad",
+        "Comoros", "Democratic Republic of the Congo", "Republic of the Congo",
+        "Côte d’Ivoire", "Djibouti", "Egypt", "Equatorial Guinea",
+        "Eritrea", "Eswatini", "Ethiopia", "Gabon", "Gambia", "Ghana",
+        "Guinea", "Guinea-Bissau", "Kenya", "Lesotho", "Liberia",
+        "Libya", "Madagascar", "Malawi", "Mali", "Mauritania",
+        "Mauritius", "Morocco", "Mozambique", "Namibia", "Niger",
+        "Nigeria", "Rwanda", "São Tomé and Príncipe", "Senegal",
+        "Seychelles", "Sierra Leone", "Somalia", "South Africa",
+        "South Sudan", "Sudan", "Tanzania", "Togo", "Tunisia",
+        "Uganda", "Zambia", "Zimbabwe"
+    ];
+    const AFRICAN_COUNTRY_SET = new Set(AFRICAN_COUNTRIES);
+
+    // Weighted nationality pool for newly generated African FSAs.
+    // Senegal 30%, Cameroon 30%, Nigeria 30%, Congo 10%.
+    const FSA_COUNTRY_WEIGHTS = [
+        { country: "Senegal", max: 30 },
+        { country: "Cameroon", max: 60 },
+        { country: "Nigeria", max: 90 },
+        { country: "Congo", max: 100 }
+    ];
+
+    function chooseFsaCountry() {
+        const roll = Math.random() * 100;
+        return FSA_COUNTRY_WEIGHTS.find(x => roll < x.max).country;
+    }
+
+    const currentSeason = bbgm.g.get("season");
+    const currentPhase = bbgm.g.get("phase");
+    const players = await bbgm.idb.cache.players.getAll();
+    const teams = await bbgm.idb.cache.teams.getAll();
+
+    if (!Number.isInteger(currentSeason)) {
+        throw new Error("Could not read the current league season. No players changed.");
+    }
+    if (currentPhase !== 8) {
+        throw new Error(
+            `Run this combined script during free agency only (phase 8). Current phase: ${currentPhase}. No players changed.`
+        );
+    }
+
+    const detected = [];
+    const restored = [];
+    const alreadyRestricted = [];
+
+    // -------------------------
+    // RULE 1: V7 RESIDENCY LOGIC
+    // -------------------------
+    for (const p of players) {
+        const marker = p[MARKER];
+
+        // Restore a previous restriction after its season has ended.
+        if (marker && currentSeason > marker.blockedThroughSeason) {
+            if (p.injury && p.injury.type === marker.injuryType) {
+                p.injury = marker.originalInjury || {
+                    type: "Healthy",
+                    gamesRemaining: 0
+                };
+            }
+
+            delete p[MARKER];
+            await bbgm.idb.cache.players.put(p);
+            restored.push(`${p.firstName} ${p.lastName}`);
+            continue;
+        }
+
+        // Keep an already-restricted player sidelined during the restriction season.
+        if (marker && currentSeason <= marker.blockedThroughSeason) {
+            p.injury = {
+                type: marker.injuryType,
+                gamesRemaining: marker.injuryGamesRemaining
+            };
+
+            await bbgm.idb.cache.players.put(p);
+            alreadyRestricted.push(`${p.firstName} ${p.lastName}`);
+            continue;
+        }
+
+        if (!COLLEGE_TIDS.has(p.tid)) {
+            continue;
+        }
+
+        const currentTid = p.tid;
+        const stats = Array.isArray(p.stats) ? p.stats : [];
+        const transactions = Array.isArray(p.transactions) ? p.transactions : [];
+
+        const signings = transactions
+            .filter(tx =>
+                tx.type === "freeAgent" &&
+                tx.tid === currentTid &&
+                tx.phase === 8 &&
+                Number.isInteger(tx.season)
+            )
+            .sort((a, b) => b.season - a.season);
+
+        let transfer = null;
+
+        for (const tx of signings) {
+            const previousRows = stats.filter(row =>
+                row.season === tx.season &&
+                COLLEGE_TIDS.has(row.tid) &&
+                row.tid !== currentTid
+            );
+
+            if (previousRows.length > 0) {
+                const previousTid = previousRows[previousRows.length - 1].tid;
+                const blockedThroughSeason = tx.season + 1;
+
+                if (currentSeason <= blockedThroughSeason) {
+                    transfer = {
+                        previousTid,
+                        newTid: currentTid,
+                        signingSeason: tx.season,
+                        blockedThroughSeason,
+                        transaction: tx
+                    };
+                    break;
+                }
+            }
+        }
+
+        if (!transfer) {
+            continue;
+        }
+
+        const originalInjury = p.injury
+            ? {
+                type: p.injury.type,
+                gamesRemaining: p.injury.gamesRemaining
+            }
+            : {
+                type: "Healthy",
+                gamesRemaining: 0
+            };
+
+        p[MARKER] = {
+            blockedThroughSeason: transfer.blockedThroughSeason,
+            previousCollegeTid: transfer.previousTid,
+            newCollegeTid: transfer.newTid,
+            signingSeason: transfer.signingSeason,
+            transactionEid: transfer.transaction.eid ?? null,
+            injuryType: INELIGIBILITY_INJURY,
+            injuryGamesRemaining: INELIGIBILITY_GAMES,
+            originalInjury
+        };
+
+        p.injury = {
+            type: INELIGIBILITY_INJURY,
+            gamesRemaining: INELIGIBILITY_GAMES
+        };
+
+        await bbgm.idb.cache.players.put(p);
+
+        detected.push({
+            name: `${p.firstName} ${p.lastName}`,
+            pid: p.pid,
+            from: transfer.previousTid,
+            to: transfer.newTid,
+            restrictedSeason: transfer.blockedThroughSeason
+        });
+    }
+
+    // -----------------------------------
+    // RULE 2: ONE AFRICAN FSA PER ACTIVE TEAM
+    // -----------------------------------
+    const activeCollegeTeams = teams.filter(t =>
+        COLLEGE_TIDS.has(t.tid) && t.disabled !== true
+    );
+
+    const africanFsaAdded = [];
+    const africanFsaAlreadyPresent = [];
+    const fsaSkipped = [];
+
+    async function createPlayerAtOvr(age, targetOvr, country) {
+        const name = await bbgm.player.name(country);
+        const p = bbgm.player.generate(
+            bbgm.PLAYER.FREE_AGENT,
+            age,
+            currentSeason - 1,
+            false,
+            34,
+            name
+        );
+
+        await bbgm.player.develop(p, 0);
+
+        const ratings = p.ratings.at(-1);
+        ratings.season = currentSeason;
+
+        // Store the intended height, then apply the height rating AFTER all
+        // development calls so player development cannot overwrite it.
+        // Keep the V9 maximum of 7'0", with the new minimum of 6'6".
+        const heightInches = 78 + Math.floor(Math.random() * 7);
+
+        // Adjust overall toward the requested range without changing height.
+        let tries = 0;
+        while (ratings.ovr !== targetOvr && tries < 2000) {
+            const direction = ratings.ovr < targetOvr ? 1 : -1;
+            let changed = false;
+            for (const key of bbgm.RATINGS) {
+                if (key === "hgt") continue;
+                const oldValue = ratings[key];
+                const newValue = bbgm.player.limitRating(oldValue + direction);
+                if (newValue !== oldValue) {
+                    ratings[key] = newValue;
+                    changed = true;
+                    await bbgm.player.develop(p, 0);
+                    if (ratings.ovr === targetOvr) break;
+                }
+            }
+            if (!changed) break;
+            tries++;
+        }
+
+        if (ratings.ovr < 55 || ratings.ovr > 65) {
+            throw new Error(`Could not generate an African FSA within 55–65 OVR (generated ${ratings.ovr}).`);
+        }
+
+        const desiredPosition = ["PF", "FC", "C"][Math.floor(Math.random() * 3)];
+        const bigManTargets = {
+            PF: { reb: 58, ins: 56, jmp: 55, stre: 54 },
+            FC: { reb: 62, ins: 62, jmp: 55, stre: 60 },
+            C:  { reb: 66, ins: 66, jmp: 58, stre: 65 }
+        }[desiredPosition];
+
+        for (const [key, value] of Object.entries(bigManTargets)) {
+            ratings[key] = Math.max(ratings[key], value);
+        }
+        await bbgm.player.develop(p, 0);
+
+        // IMPORTANT V13 FIX:
+        // BBGM stores the player's actual displayed height in p.hgt (inches).
+        // ratings.hgt is a separate basketball rating, not the height in inches.
+        // Set the actual height field directly after all development/recalculation.
+        const finalRatings = p.ratings.at(-1);
+        finalRatings.season = currentSeason;
+
+        p.imgURL = "/img/blank-face.png";
+        if (p.face !== undefined) delete p.face;
+        await bbgm.player.updateValues(p);
+
+        // Apply the physical height in inches to the player record itself.
+        p.hgt = heightInches;
+
+        // Validate the actual displayed-height field, not ratings.hgt.
+        if (!Number.isInteger(p.hgt) || p.hgt < 78 || p.hgt > 84) {
+            throw new Error(`Generated African FSA actual height is outside 6'6"–7'0" (${p.hgt} inches).`);
+        }
+        if (verifiedRatings.ovr < 55 || verifiedRatings.ovr > 65) {
+            throw new Error(`Generated African FSA OVR outside 55–65 after final recalculation (${verifiedRatings.ovr}).`);
+        }
+
+        return { player: p, heightInches, desiredPosition };
+    }
+
+    // Refresh player list after residency edits so roster checks use current records.
+    const currentPlayers = await bbgm.idb.cache.players.getAll();
+
+    for (const team of activeCollegeTeams) {
+        const roster = currentPlayers.filter(p => p.tid === team.tid);
+        const africanPlayers = roster.filter(p =>
+            p.born && AFRICAN_COUNTRY_SET.has(p.born.loc)
+        );
+
+        if (africanPlayers.length > 0) {
+            africanFsaAlreadyPresent.push({
+                tid: team.tid,
+                team: team.name,
+                count: africanPlayers.length,
+                players: africanPlayers.map(p => `${p.firstName} ${p.lastName}`)
+            });
+            continue;
+        }
+
+        // Team/season marker prevents another generation if the script is rerun.
+        const markerKey = `${FSA_MARKER}_${team.tid}`;
+        const existingMarker = await bbgm.idb.cache.gameAttributes.get(markerKey);
+        if (existingMarker && existingMarker.value === currentSeason) {
+            fsaSkipped.push({ tid: team.tid, team: team.name, reason: "Already generated this season" });
+            continue;
+        }
+
+        const country = chooseFsaCountry();
+        const targetOvr = bbgm.random.randInt(55, 65);
+        const age = bbgm.random.randInt(19, 23);
+        const generated = await createPlayerAtOvr(age, targetOvr, country);
+        const p = generated.player;
+
+        p.tid = team.tid;
+        p.born.loc = country;
+        p.college = "International";
+        p.imgURL = "/img/blank-face.png";
+        p.contract = {
+            amount: 1000,
+            exp: currentSeason + 1
+        };
+
+        await bbgm.idb.cache.players.put(p);
+        await bbgm.idb.cache.gameAttributes.put({
+            key: markerKey,
+            value: currentSeason
+        });
+
+        africanFsaAdded.push({
+            name: `${p.firstName} ${p.lastName}`,
+            pid: p.pid,
+            tid: team.tid,
+            team: team.name,
+            country,
+            position: generated.desiredPosition,
+            heightInches: generated.heightInches,
+            ovr: p.ratings.at(-1).ovr
+        });
+    }
+
+    // Replace BBGM cartoon-face appearances with the requested blank image.
+    const allPlayersForAppearance = await bbgm.idb.cache.players.getAll();
+    const appearanceUpdated = [];
+    for (const p of allPlayersForAppearance) {
+        if (p.face && typeof p.face === "object") {
+            p.imgURL = "/img/blank-face.png";
+            delete p.face;
+            await bbgm.idb.cache.players.put(p);
+            appearanceUpdated.push(p.pid);
+        }
+    }
+
+    const reportLines = [
+        `UAAP COMBINED RULES V13 — Season ${currentSeason}, phase ${currentPhase}`,
+        `Residency: newly restricted ${detected.length}; already restricted ${alreadyRestricted.length}; restored ${restored.length}`,
+        `African FSA: active teams checked ${activeCollegeTeams.length}; generated ${africanFsaAdded.length}; already had African player ${africanFsaAlreadyPresent.length}; skipped by marker ${fsaSkipped.length}`,
+        `Cartoon-face appearances converted: ${appearanceUpdated.length}`,
+        ...detected.map(x =>
+            `${x.name} (PID ${x.pid}): team ${x.from} -> FA -> team ${x.to}; ineligible season ${x.restrictedSeason}`
+        ),
+        ...africanFsaAdded.map(x =>
+            `Generated ${x.name} (PID ${x.pid}) for ${x.team}: ${x.country}, ${x.position}, ${x.heightInches} inches, ${x.ovr} OVR`
+        ),
+        ...africanFsaAlreadyPresent.map(x =>
+            `${x.team}: already has African player(s): ${x.players.join(", ")}`
+        ),
+        ...fsaSkipped.map(x => `${x.team}: ${x.reason}`)
+    ];
+
+    const reportText = reportLines.join("<br>");
+
+    bbgm.logEvent({
+        type: "injury",
+        text: reportText,
+        showNotification: true,
+        persistent: true,
+        score: 20,
+        pids: [
+            ...detected.map(x => x.pid),
+            ...africanFsaAdded.map(x => x.pid)
+        ],
+        tids: [
+            ...new Set([
+                ...africanFsaAdded.map(x => x.tid),
+                ...africanFsaAlreadyPresent.map(x => x.tid)
+            ])
+        ]
+    });
+
+    return {
+        version: "V13",
+        currentSeason,
+        currentPhase,
+        playersScanned: players.length,
+        activeCollegeTeamsChecked: activeCollegeTeams.length,
+        newlyRestricted: detected.length,
+        alreadyRestricted: alreadyRestricted.length,
+        restoredAfterRestriction: restored.length,
+        detectedTransfers: detected,
+        africanFsaGenerated: africanFsaAdded,
+        teamsAlreadyWithAfricanPlayer: africanFsaAlreadyPresent,
+        teamsSkippedBySeasonMarker: fsaSkipped,
+        cartoonFacesConverted: appearanceUpdated.length
+    };
+})().catch(error => {
+    bbgm.logEvent({
+        type: "other",
+        text: `UAAP Combined Rules V13 ERROR: ${String(error && error.message ? error.message : error)}`,
+        showNotification: true,
+        persistent: true,
+        score: 20
+    });
+    throw error;
+});
