@@ -1,0 +1,224 @@
+/*
+UAAP COLLEGE TRANSFER RESIDENCY — V7
+Basketball GM Worker Console
+
+RULE
+A player who played for one of the 16 UAAP college teams and then signed
+with a DIFFERENT UAAP college team through free agency during offseason
+(phase 8) is ineligible for the following season.
+
+Example:
+2020 season: UE
+2020 offseason / free agency: signs with Adamson
+2021 season: ineligible
+
+First-time entrants with no prior college-team stats are exempt.
+Players remain on their new team's roster.
+
+HOW TO RUN
+1. Open Tools > Danger Zone > Worker Console.
+2. Paste this entire script and click Run code.
+3. Run after offseason free-agency signings are complete and before the
+   next preseason/regular season begins.
+4. Run once per offseason. It is safe to run more than once in the same season.
+
+WHAT IT DOES
+- Reads the current season using the documented bbgm.g.get("season") API.
+- Finds a phase-8 freeAgent transaction to the player's current college team.
+- Confirms the player had stats for a different college team in that
+  transaction season.
+- Sets a custom "Residency" injury for 40 games as an in-game proxy for ineligibility.
+- Stores the player's original injury so it can be restored after the
+  restricted season.
+- Writes a league event showing the result.
+
+NOTE
+This is a workaround using BBGM's injury system; it does not create a
+native eligibility rule. Back up/export your league before running.
+*/
+
+(async () => {
+    "use strict";
+
+    const COLLEGE_TIDS = new Set([
+        0, 1, 2, 3, 4, 5, 6, 7,
+        8, 9, 10, 11, 12, 13, 14, 15
+    ]);
+
+    const MARKER = "uaapResidencyV7";
+    const INELIGIBILITY_INJURY = "Residency";
+    const INELIGIBILITY_GAMES = 40;
+
+    const currentSeason = bbgm.g.get("season");
+    const players = await bbgm.idb.cache.players.getAll();
+
+    if (!Number.isInteger(currentSeason)) {
+        throw new Error("Could not read the current league season. No players changed.");
+    }
+
+    const detected = [];
+    const restored = [];
+    const alreadyRestricted = [];
+
+    for (const p of players) {
+        // Restore a previous restriction after its season has ended.
+        const marker = p[MARKER];
+
+        if (marker && currentSeason > marker.blockedThroughSeason) {
+            if (p.injury && p.injury.type === marker.injuryType) {
+                p.injury = marker.originalInjury || {
+                    type: "Healthy",
+                    gamesRemaining: 0
+                };
+            }
+
+            delete p[MARKER];
+            await bbgm.idb.cache.players.put(p);
+
+            restored.push(`${p.firstName} ${p.lastName}`);
+            continue;
+        }
+
+        // Keep an already-restricted player sidelined during the restriction season.
+        if (marker && currentSeason <= marker.blockedThroughSeason) {
+            p.injury = {
+                type: marker.injuryType,
+                gamesRemaining: marker.injuryGamesRemaining
+            };
+
+            await bbgm.idb.cache.players.put(p);
+            alreadyRestricted.push(`${p.firstName} ${p.lastName}`);
+            continue;
+        }
+
+        // Only currently rostered players on one of the 16 college teams.
+        if (!COLLEGE_TIDS.has(p.tid)) {
+            continue;
+        }
+
+        const currentTid = p.tid;
+        const stats = Array.isArray(p.stats) ? p.stats : [];
+        const transactions = Array.isArray(p.transactions) ? p.transactions : [];
+
+        // Look for a free-agent signing to the player's CURRENT college team.
+        const signings = transactions
+            .filter(tx =>
+                tx.type === "freeAgent" &&
+                tx.tid === currentTid &&
+                tx.phase === 8 &&
+                Number.isInteger(tx.season)
+            )
+            .sort((a, b) => b.season - a.season);
+
+        let transfer = null;
+
+        for (const tx of signings) {
+            // Require evidence from the season immediately preceding the
+            // offseason signing: a stats row for another college team.
+            const previousRows = stats.filter(row =>
+                row.season === tx.season &&
+                COLLEGE_TIDS.has(row.tid) &&
+                row.tid !== currentTid
+            );
+
+            if (previousRows.length > 0) {
+                const previousTid = previousRows[previousRows.length - 1].tid;
+                const blockedThroughSeason = tx.season + 1;
+
+                if (currentSeason <= blockedThroughSeason) {
+                    transfer = {
+                        previousTid,
+                        newTid: currentTid,
+                        signingSeason: tx.season,
+                        blockedThroughSeason,
+                        transaction: tx
+                    };
+                    break;
+                }
+            }
+        }
+
+        if (!transfer) {
+            continue;
+        }
+
+        const originalInjury = p.injury
+            ? {
+                type: p.injury.type,
+                gamesRemaining: p.injury.gamesRemaining
+            }
+            : {
+                type: "Healthy",
+                gamesRemaining: 0
+            };
+
+        p[MARKER] = {
+            blockedThroughSeason: transfer.blockedThroughSeason,
+            previousCollegeTid: transfer.previousTid,
+            newCollegeTid: transfer.newTid,
+            signingSeason: transfer.signingSeason,
+            transactionEid: transfer.transaction.eid ?? null,
+            injuryType: INELIGIBILITY_INJURY,
+            injuryGamesRemaining: INELIGIBILITY_GAMES,
+            originalInjury
+        };
+
+        p.injury = {
+            type: INELIGIBILITY_INJURY,
+            gamesRemaining: INELIGIBILITY_GAMES
+        };
+
+        await bbgm.idb.cache.players.put(p);
+
+        detected.push({
+            name: `${p.firstName} ${p.lastName}`,
+            pid: p.pid,
+            from: transfer.previousTid,
+            to: transfer.newTid,
+            restrictedSeason: transfer.blockedThroughSeason
+        });
+    }
+
+    const reportLines = [
+        `UAAP RESIDENCY V7 — Season ${currentSeason}`,
+        `Newly restricted: ${detected.length}`,
+        `Already restricted: ${alreadyRestricted.length}`,
+        `Restored after restriction: ${restored.length}`,
+        ...detected.map(x =>
+            `${x.name} (PID ${x.pid}): team ${x.from} -> FA -> team ${x.to}; ineligible season ${x.restrictedSeason}`
+        ),
+        ...alreadyRestricted.map(name => `${name}: restriction remains active`),
+        ...restored.map(name => `${name}: original injury status restored`)
+    ];
+
+    const reportText = reportLines.join("<br>");
+
+    // Use the documented Worker Console event API so the result is visible
+    // in the league's event/news feed.
+    bbgm.logEvent({
+        type: "injury",
+        text: reportText,
+        showNotification: true,
+        persistent: true,
+        score: 20,
+        pids: detected.map(x => x.pid)
+    });
+
+    return {
+        currentSeason,
+        playersScanned: players.length,
+        newlyRestricted: detected.length,
+        alreadyRestricted: alreadyRestricted.length,
+        restoredAfterRestriction: restored.length,
+        detectedTransfers: detected
+    };
+})().catch(error => {
+    bbgm.logEvent({
+        type: "other",
+        text: `UAAP Residency V7 ERROR: ${String(error && error.message ? error.message : error)}`,
+        showNotification: true,
+        persistent: true,
+        score: 20
+    });
+    throw error;
+});
